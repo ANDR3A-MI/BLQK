@@ -1,0 +1,110 @@
+name: Crea ISO Syntra
+
+on:
+  # Avvio manuale da GitHub: Actions → "Crea ISO Syntra" → Run workflow
+  workflow_dispatch:
+    inputs:
+      antix_version:
+        description: "Versione di antiX da usare come base (vuoto = quella in config.env)"
+        required: false
+        default: ""
+      arduino_ide:
+        description: "Arduino IDE: legacy = 1.8.19 (leggera), 2 = ultima 2.x (pesante)"
+        type: choice
+        options: ["config.env", "legacy", "2"]
+        default: "config.env"
+      antix_sha256:
+        description: "Controllo ISO antiX: vuoto = config.env, 'skip' = non verificare"
+        required: false
+        default: ""
+  # Ogni tag v* (es. v1.0) crea anche una Release con la ISO allegata
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-iso-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Scarica il repository
+        uses: actions/checkout@v4
+
+      # Nel repository bastano due file: questo workflow e syntra-os.tar.gz.
+      # L'archivio viene estratto qui (e sostituisce eventuali file sciolti più vecchi).
+      - name: Estrai i file di Syntra
+        run: |
+          if [ -f syntra-os.tar.gz ]; then
+            tar -xzf syntra-os.tar.gz --strip-components=1
+            echo "Estratto syntra-os.tar.gz"
+          fi
+          if [ ! -f build.sh ]; then
+            echo "::error::build.sh non trovato: carica syntra-os.tar.gz nella cartella principale del repository"
+            exit 1
+          fi
+          grep -m1 '^SYNTRA_BUILD_REV=' build.sh || true
+
+      - name: Libera spazio sul runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Costruisci la ISO
+        env:
+          ANTIX_VERSION_OVERRIDE: ${{ inputs.antix_version }}
+          ANTIX_SHA256_OVERRIDE: ${{ inputs.antix_sha256 }}
+          ARDUINO_IDE_OVERRIDE: ${{ inputs.arduino_ide != 'config.env' && inputs.arduino_ide || '' }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x build.sh scripts/*.sh
+          sudo -E ./build.sh
+
+      - name: Riepilogo della build
+        if: always()
+        run: |
+          {
+            echo "## Syntra — esito della build"
+            echo '```'
+            cat out/build-report.txt 2>/dev/null || echo "nessun report (la build si è fermata prima)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Carica la ISO come artefatto
+        uses: actions/upload-artifact@v4
+        with:
+          name: syntra-iso
+          path: |
+            out/*.iso
+            out/*.sha256
+            out/build-report.txt
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Carica i log (utile se qualcosa va storto)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syntra-log
+          path: |
+            out/build-report.txt
+            out/chroot.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Pubblica la Release (solo per i tag v*)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.iso
+            out/*.sha256
+            out/build-report.txt
